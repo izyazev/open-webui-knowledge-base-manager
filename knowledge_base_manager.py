@@ -1,3 +1,14 @@
+"""
+Knowledge Base Manager — Open WebUI tool for managing knowledge bases,
+directories and files from chat.
+
+Verified end-to-end against Open WebUI 0.12.0 (release 2026-10-10):
+all API endpoints used below still exist with unchanged paths, payloads
+and response schemas, so no endpoint migration was needed.
+
+Revision notes are marked with "0.12.0:" (API facts) and "v1.1.0:" (bug fixes).
+"""
+
 import asyncio
 import json
 from typing import Any, Optional
@@ -5,12 +16,59 @@ from typing import Any, Optional
 import aiohttp
 from pydantic import Field
 
+# v1.1.0: Open WebUI runs tool calls inside its own server process. A directory
+# path is resolved with "list the level, then create the missing part", so two
+# calls that touch the same not-yet-existing path can both create it. At the
+# root level the database cannot reject such a duplicate, because parent_id is
+# NULL there and UNIQUE(knowledge_id, parent_id, name) treats every NULL as
+# different. The result is two same-name folders, after which every path-based
+# function fails with "Multiple matching directories found".
+# One lazily created asyncio lock per running event loop, shared by all tool
+# instances in the process, serializes directory creation and keeps paths
+# unambiguous.
+_PROCESS_LOCKS: dict = {}
+
+
+def _process_lock():
+    """Return one asyncio lock per running event loop, creating it on demand."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    key = id(loop)
+    lock = _PROCESS_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PROCESS_LOCKS[key] = lock
+    return lock
+
 
 class Tools:
     """Open WebUI knowledge base management tool.
 
     File indexing remains synchronous: the file creation operation waits
     until Open WebUI finishes processing and indexing.
+
+    0.12.0: the tool was re-checked against the 0.12.0 API.
+    - /knowledge/{id}/files, /knowledge/{id}/dirs/*, /knowledge/search/files,
+      /files/... and /files/{id}/data/content/update are all unchanged.
+    - File upload still accepts ?process=true&process_in_background=false,
+      so creation/update stays synchronous.
+    - The knowledge base itself is now also a file browser in the UI, but the
+      underlying API is the same.
+    - Two documentation bugs were fixed (see the two "0.12.0:" notes further
+      down): content search DOES exist, and edit failures now surface as real
+      errors instead of silent success.
+
+    v2: duplicate-directory race fixed.
+    Open WebUI represents a directory as UNIQUE(knowledge_id, parent_id, name),
+    but at the root level parent_id is NULL, and a NULL never equals another NULL
+    in that unique index. Two concurrent calls that create the same missing path
+    could therefore both create it, leaving two same-name folders, after which
+    every path-based function failed with "Multiple matching directories found".
+    Directory creation is now serialized and made idempotent, an ambiguous match
+    reports the conflicting directory_ids, and find_duplicate_directories lists
+    existing duplicates so they can be cleaned up.
     """
 
     def __init__(self):
@@ -69,6 +127,9 @@ class Tools:
         return parts, None
 
     def _file_item(self, item):
+        # Older Open WebUI releases wrapped list entries as {"file": {...}}.
+        # 0.11.x / 0.12.0 return a flat FileUserResponse, so this is a
+        # harmless compatibility shim.
         return item.get("file", item) if isinstance(item, dict) else {}
 
     async def _directory_listing(self, session, knowledge_id, directory_id=""):
@@ -121,7 +182,7 @@ class Tools:
             if not matches:
                 return None, f"Directory not found: {part}"
             if len(matches) > 1:
-                return None, f"Multiple matching directories found: {part}"
+                return None, self._duplicate_error(part, matches)
             current = matches[0].get("id")
         return current, None
 
@@ -141,7 +202,12 @@ class Tools:
         if not matches:
             return None, f"File not found: {filename}"
         if len(matches) > 1:
-            return None, f"Multiple matching files found: {filename}"
+            ids = ", ".join(str(m.get("id")) for m in matches)
+            return (
+                None,
+                f"Multiple matching files found: {filename} "
+                f"(file_ids: {ids}). Rename or delete one of them first.",
+            )
         return matches[0], None
 
     async def _knowledge_has_content(
@@ -372,35 +438,121 @@ class Tools:
         reused = []
         current = ""
         async with await self._open_session(__request__) as session:
-            for part in parts:
-                listing, err = await self._directory_listing(
-                    session, knowledge_id, current
-                )
-                if err:
-                    return err
-                matches = [
-                    d
-                    for d in listing["directories"]
-                    if d.get("name", "").casefold() == part.casefold()
-                ]
-                if len(matches) > 1:
-                    return f"Multiple matching directories found: {part}"
-                if matches:
-                    current = matches[0].get("id")
-                    reused.append(part)
-                    continue
-                data, err = await self._request(
-                    session,
-                    "POST",
-                    f"/knowledge/{knowledge_id}/dirs/create",
-                    expected=(200, 201),
-                    json={"name": part, "parent_id": current or None},
-                )
-                if err:
-                    return err
-                current = data.get("id")
-                created.append(part)
+            # v2: serialize the whole "list then create" chain so concurrent
+            # calls cannot create the same folder twice.
+            async with _process_lock():
+                for part in parts:
+                    listing, err = await self._directory_listing(
+                        session, knowledge_id, current
+                    )
+                    if err:
+                        return err
+                    matches = [
+                        d
+                        for d in listing["directories"]
+                        if d.get("name", "").casefold() == part.casefold()
+                    ]
+                    if len(matches) > 1:
+                        return self._duplicate_error(part, matches)
+                    if matches:
+                        current = matches[0].get("id")
+                        reused.append(part)
+                        continue
+                    # v2: reuse a sibling that appeared meanwhile instead of
+                    # failing the whole path.
+                    new_id, err = await self._create_or_reuse_dir(
+                        session, knowledge_id, current, part
+                    )
+                    if err:
+                        return err
+                    current = new_id
+                    created.append(part)
         return f"Knowledge directory path ready.\npath={'/'.join(parts)}\ndirectory_id={current}\ncreated={', '.join(created) or 'none'}\nreused={', '.join(reused) or 'none'}"
+
+    async def find_duplicate_directories(
+        self,
+        knowledge_id: str = Field(
+            ..., description="ID of the Open WebUI knowledge base."
+        ),
+        __request__=None,
+    ) -> str:
+        """
+        Find same-name directories that exist at the same level of a knowledge base.
+
+        v2: Open WebUI cannot break the tie for such duplicates on its own, and
+        every path-based function refuses to work with an ambiguous path. This
+        read-only helper lists the duplicates with their directory_ids and the
+        files inside them, so the user can decide which one to keep: move the
+        files out with move_knowledge_directory-style manual steps (read the
+        level, move the wanted directory) and delete the leftover empty one.
+
+        Nothing is modified here.
+        """
+        if __request__ is None:
+            return "Error: Open WebUI request context is unavailable."
+        lines = []
+        visited = set()
+        async with await self._open_session(__request__) as session:
+            meta, err = await self._request(
+                session, "GET", f"/knowledge/{knowledge_id}"
+            )
+            if err:
+                return err
+
+            async def walk(directory_id, path_parts):
+                key = directory_id or "ROOT"
+                if key in visited:
+                    return
+                visited.add(key)
+                listing, err = await self._directory_listing(
+                    session, knowledge_id, directory_id
+                )
+                if err:
+                    lines.append("  " * len(path_parts) + err)
+                    return
+                groups = {}
+                for d in listing["directories"]:
+                    groups.setdefault(str(d.get("name", "")).casefold(), []).append(d)
+                for name_key, dirs in groups.items():
+                    if len(dirs) > 1:
+                        where = "/".join(path_parts) or "ROOT"
+                        lines.append(
+                            f"DUPLICATE in {where}: {dirs[0].get('name')} "
+                            f"({len(dirs)} copies)"
+                        )
+                        for d in dirs:
+                            child_list = await self._directory_listing(
+                                session, knowledge_id, d.get("id")
+                            )
+                            files = child_list[0]["items"] if child_list[0] else []
+                            lines.append(
+                                f"  - directory_id={d.get('id')}, "
+                                f"files={len(files)}"
+                                + (
+                                    " ["
+                                    + ", ".join(
+                                        self._file_item(f).get("filename", "?")
+                                        for f in files
+                                    )
+                                    + "]"
+                                    if files
+                                    else ""
+                                )
+                            )
+                for d in listing["directories"]:
+                    await walk(d.get("id"), path_parts + [d.get("name", "?")])
+
+            await walk("", [])
+
+        if not lines:
+            return (
+                "No duplicate directories found.\n"
+                f"knowledge_id={knowledge_id}\nname={meta.get('name','Unnamed')}"
+            )
+        return (
+            "Duplicate directories found (path-based functions will refuse "
+            "ambiguous paths until these are resolved):\n" + "\n".join(lines)
+        )
 
     async def _upload(self, session, knowledge_id, directory_id, filename, content):
         form = aiohttp.FormData()
@@ -493,17 +645,74 @@ class Tools:
         if __request__ is None:
             return "Error: Open WebUI request context is unavailable."
         async with await self._open_session(__request__) as session:
-            directory, err = await self._ensure_dirs(session, knowledge_id, parts[:-1])
-            if err:
-                return err
-            data, err = await self._upload(
-                session, knowledge_id, directory, filename, content
-            )
+            # v2: create the file inside the same lock that guarantees a unique
+            # directory chain, so the directory the file is written into cannot
+            # be duplicated between the lookup and the upload.
+            async with _process_lock():
+                directory, err = await self._ensure_dirs_locked(
+                    session, knowledge_id, parts[:-1]
+                )
+                if err:
+                    return err
+                data, err = await self._upload(
+                    session, knowledge_id, directory, filename, content
+                )
         if err:
             return err
         return f"Knowledge Markdown file created successfully.\npath={'/'.join(parts[:-1]+[filename])}\nfilename={data.get('filename',filename)}\nfile_id={data.get('id')}\ndirectory_id={directory or 'ROOT'}"
 
+    @staticmethod
+    def _duplicate_error(name, matches):
+        ids = ", ".join(str(m.get("id")) for m in matches)
+        return (
+            f"Multiple matching directories found: {name}. "
+            f"Resolve the duplicates first (directory_ids: {ids})."
+        )
+
+    async def _create_or_reuse_dir(self, session, knowledge_id, parent_id, name):
+        """Return the id of the single directory called `name` under `parent_id`.
+
+        v2: idempotent and race-tolerant. If the create call fails because the
+        level appeared in the meantime (or because Open WebUI rejected a
+        same-name sibling it cannot represent in its unique index), the level is
+        re-read and an existing match is reused instead of returning an error.
+        More than one same-name sibling is never resolved by guessing.
+        """
+        data, err = await self._request(
+            session,
+            "POST",
+            f"/knowledge/{knowledge_id}/dirs/create",
+            expected=(200, 201),
+            json={"name": name, "parent_id": parent_id or None},
+        )
+        if not err:
+            return data.get("id"), None
+
+        listing, list_err = await self._directory_listing(
+            session, knowledge_id, parent_id or ""
+        )
+        if list_err:
+            return None, err
+        matches = [
+            d
+            for d in listing["directories"]
+            if str(d.get("name", "")).casefold() == name.casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0].get("id"), None
+        if len(matches) > 1:
+            return None, self._duplicate_error(name, matches)
+        return None, err
+
     async def _ensure_dirs(self, session, knowledge_id, parts):
+        """Resolve/create a chain of directories, serialized against races."""
+        if not parts:
+            return "", None
+        async with _process_lock():
+            return await self._ensure_dirs_locked(session, knowledge_id, parts)
+
+    async def _ensure_dirs_locked(self, session, knowledge_id, parts):
+        """Body of _ensure_dirs; the caller already holds the process lock."""
         current = ""
         for part in parts:
             listing, err = await self._directory_listing(session, knowledge_id, current)
@@ -515,20 +724,15 @@ class Tools:
                 if d.get("name", "").casefold() == part.casefold()
             ]
             if len(matches) > 1:
-                return None, f"Multiple matching directories found: {part}"
+                return None, self._duplicate_error(part, matches)
             if matches:
                 current = matches[0].get("id")
                 continue
-            data, err = await self._request(
-                session,
-                "POST",
-                f"/knowledge/{knowledge_id}/dirs/create",
-                expected=(200, 201),
-                json={"name": part, "parent_id": current or None},
+            current, err = await self._create_or_reuse_dir(
+                session, knowledge_id, current, part
             )
             if err:
                 return None, err
-            current = data.get("id")
         return current, None
 
     async def _read_or_update_path(self, knowledge_id, path, content, update, request):
@@ -582,6 +786,12 @@ class Tools:
         """
         Replace the content of an existing Open WebUI knowledge file
         and reindex it for retrieval.
+
+        0.12.0: the API now returns HTTP 500 when the new text could not be
+        indexed or when a knowledge base using the file could not be reindexed,
+        instead of reporting success while searches kept the old text. That
+        error is surfaced here verbatim, so a success message really means the
+        new content is indexed.
         """
         if __request__ is None:
             return "Error: Open WebUI request context is unavailable."
@@ -686,6 +896,8 @@ class Tools:
         - Existing file is updated and reindexed.
         - Missing file is created and indexed.
         - Ambiguous directory or file matches are never guessed.
+        - v2: concurrent calls cannot create duplicate folders, because
+          directory creation is serialized and idempotent.
         """
         parts, err = self._path_parts(path)
         if err:
@@ -696,31 +908,36 @@ class Tools:
         if __request__ is None:
             return "Error: Open WebUI request context is unavailable."
         async with await self._open_session(__request__) as s:
-            directory, err = await self._ensure_dirs(s, knowledge_id, parts[:-1])
-            if err:
-                return err
-            item, finderr = await self._find_file_in_directory(
-                s, knowledge_id, directory, filename
-            )
-            if finderr and finderr != f"File not found: {filename}":
-                # API errors or ambiguous matches must not lead to creating
-                # a new file and a possible duplicate.
-                return finderr
-            if not finderr:
-                _, err = await self._request(
-                    s,
-                    "POST",
-                    f"/files/{item.get('id')}/data/content/update",
-                    expected=(200, 201),
-                    json={"content": content},
-                    timeout=self._long_timeout,
+            # v2: hold the lock across the existence check and the create/update,
+            # so a concurrent upsert of the same path cannot race with it.
+            async with _process_lock():
+                directory, err = await self._ensure_dirs_locked(
+                    s, knowledge_id, parts[:-1]
                 )
                 if err:
                     return err
-                return f"Knowledge Markdown file updated successfully.\naction=updated\npath={'/'.join(parts[:-1]+[filename])}\nfile_id={item.get('id')}"
-            data, err = await self._upload(
-                s, knowledge_id, directory, filename, content
-            )
+                item, finderr = await self._find_file_in_directory(
+                    s, knowledge_id, directory, filename
+                )
+                if finderr and finderr != f"File not found: {filename}":
+                    # API errors or ambiguous matches must not lead to creating
+                    # a new file and a possible duplicate.
+                    return finderr
+                if not finderr:
+                    _, err = await self._request(
+                        s,
+                        "POST",
+                        f"/files/{item.get('id')}/data/content/update",
+                        expected=(200, 201),
+                        json={"content": content},
+                        timeout=self._long_timeout,
+                    )
+                    if err:
+                        return err
+                    return f"Knowledge Markdown file updated successfully.\naction=updated\npath={'/'.join(parts[:-1]+[filename])}\nfile_id={item.get('id')}"
+                data, err = await self._upload(
+                    s, knowledge_id, directory, filename, content
+                )
         if err:
             return err
         return f"Knowledge Markdown file created successfully.\naction=created\npath={'/'.join(parts[:-1]+[filename])}\nfile_id={data.get('id')}"
@@ -738,6 +955,10 @@ class Tools:
     ) -> str:
         """
         Rename an existing Open WebUI knowledge file.
+
+        0.12.0: citations from a knowledge file now show the file's current name
+        right after the rename, so renamed files no longer keep showing the old
+        name in answers.
         """
         new_filename = new_filename.strip()
         if not new_filename:
@@ -869,7 +1090,9 @@ class Tools:
         Safety:
         - confirm must be true;
         - exact directory path and filename must resolve;
-        - ambiguous matches are never deleted.
+        - ambiguous matches are never deleted;
+        - v2: when several same-name files sit in the directory, its file_ids are
+          reported so one can be renamed/deleted explicitly.
         """
         if confirm is not True:
             return "Deletion cancelled: confirm must be true."
@@ -907,7 +1130,7 @@ class Tools:
         Delete a directory from an Open WebUI knowledge base.
 
         Files inside the directory are moved to its parent directory
-        instead of being deleted.
+        instead of being deleted (move_files=true is sent explicitly).
         """
         if __request__ is None:
             return "Error: Open WebUI request context is unavailable."
@@ -939,12 +1162,26 @@ class Tools:
         Search files across all Open WebUI knowledge bases available
         to the current user.
 
-        By default searches metadata/filenames.
-        Set include_content=true to return file content preview for found files.
-        max_content_items limits how many files will have their content fetched (default: 10).
+        By default the query is matched against filenames only (case-insensitive).
+        Set include_content=true to ALSO match the query against the extracted
+        text of the files and to return a content preview for each hit.
 
-        Note: Open WebUI search API searches by filename, not by file content.
-        Full-text search within file content is not supported by the current API.
+        0.12.0: the previous note "the search API searches by filename, not by
+        file content" was WRONG. The endpoint GET /api/v1/knowledge/search/files
+        performs a case-insensitive substring match over File.filename and, when
+        include_content=true, over the stored extracted content as well.
+
+        Caveats that still hold in 0.12.0:
+        - the match is substring-based, not semantic/relevance-ranked;
+        - content matching only covers the first RAG_FILE_CONTENT_SEARCH_MAX_CHARS
+          characters of each file (64 MiB by default);
+        - the search response never contains the text itself (File.data is
+          deferred), so previews are fetched with one extra request per hit,
+          capped by max_content_items (default 10);
+        - a file placed in several knowledge bases is returned once per
+          knowledge base;
+        - for semantic retrieval over document text use Open WebUI's normal
+          knowledge retrieval or read a known file directly.
         """
         query = query.strip()
         if not query:
@@ -977,12 +1214,24 @@ class Tools:
                 file_data = self._file_item(item)
                 filename = file_data.get("filename", file_data.get("name", "Unnamed"))
                 file_id = file_data.get("id")
-                result.append(f"- {filename} (file_id={file_id})")
+
+                # 0.12.0: hits also carry the owning knowledge base and the
+                # file's exact location, which lets the model address the file
+                # precisely instead of guessing a path.
+                location = []
+                if isinstance(item, dict):
+                    collection = item.get("collection") or {}
+                    if isinstance(collection, dict) and collection.get("name"):
+                        location.append(f"knowledge={collection['name']}")
+                    directory_path = item.get("directory_path")
+                    if directory_path:
+                        location.append(f"path={directory_path}/{filename}")
+                suffix = (", " + ", ".join(location)) if location else ""
+                result.append(f"- {filename} (file_id={file_id}{suffix})")
 
                 if include_content and file_id and i < max_content_items:
-                    # Some Open WebUI versions do not return the text in the search
-                    # response. Therefore, with include_content we fetch it with
-                    # a separate request.
+                    # The search response never returns the text, so with
+                    # include_content the preview is fetched per file.
                     content_data, content_error = await self._request(
                         s, "GET", f"/files/{file_id}/data/content"
                     )
@@ -1033,7 +1282,7 @@ class Tools:
                 exact = [
                     x
                     for x in items
-                    if x.get("filename", "").casefold()
+                    if self._file_item(x).get("filename", "").casefold()
                     == exact_filename.strip().casefold()
                 ]
                 if exact:
@@ -1042,16 +1291,16 @@ class Tools:
                 return "No matching knowledge file found."
             if len(items) > 1:
                 return "Multiple matching files found:\n" + "\n".join(
-                    f"- {x.get('filename','Unnamed')} (file_id={x.get('id')})"
+                    f"- {self._file_item(x).get('filename','Unnamed')} (file_id={self._file_item(x).get('id')})"
                     for x in items
                 )
-            x = items[0]
+            target = self._file_item(items[0])
             data, e = await self._request(
-                s, "GET", f"/files/{x.get('id')}/data/content"
+                s, "GET", f"/files/{target.get('id')}/data/content"
             )
         return (
             e
-            or f"filename={x.get('filename','Unnamed')}\nfile_id={x.get('id')}\n\n{(data or {}).get('content','')}"
+            or f"filename={target.get('filename','Unnamed')}\nfile_id={target.get('id')}\n\n{(data or {}).get('content','')}"
         )
 
     async def get_knowledge_tree(
